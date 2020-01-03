@@ -1,0 +1,579 @@
+---
+title: "EDA of Titanic Data and Survival Predictions"
+output: 
+    md_document:
+      variant: markdown_github
+      toc: true
+editor_options:
+  chunk_output_type: console
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Introduction
+This exploratory data analysis and model building is based on upon the Titanic dataset available from kaggle (https://www.kaggle.com/c/titanic). 
+
+The objective put fourth by kaggle was to create a model that predicts which passengers survived the Titanic shipwreck. 
+
+There were two datasets used for this analysis (1) the training dataset and (2) the testing dataset. The training dataset will include the relevant details of a subset of passengers (n=891), and also includes their survival status. The testing dataset (n=418) includes the same characteristics, but does not report the survival status. Thus, the goal is to use the training dataset to develop the predictive model, using the observed relationships, and the testing dataset to predict the survival outcomes of passengers in the testing dataset (i.e., external validation of the model).This r markdown focuses on the EDA of the training dataset and development of the two predictive models. The models were applied to the testing dataset in a seperate script for the kaggle submissions.
+
+## Data Dictionary
+* survival (outcome of interest--develop models to predict survival status)
+  + 0 = No, 1 = Yes
+* pclass
+  + Passenger's ticket class: 1 = 1st, 2 = 2nd, 3 = 3rd
+* sex
+  + male or female
+* Age
+  + Age in years
+* sibsp
+  + Number of siblings or spouses aboard the Titanic
+* parch
+  + Number of parents or children aboard the Titanic
+* ticket
+  + Ticket number
+* fare
+  + Passenger's fare
+* cabin
+  + Cabin number
+* embarked
+  + Port of embarkation: C = Cherbourg, Q = Queenstown, S = Southampton
+
+
+# Load Libraries and Initial Data Preparation
+Load the required libraries for the analysis
+```{r results='hide', message=FALSE, warning=FALSE}
+#Includes data we will be analyzing
+library(titanic)
+#Includes dplyr, ggplot etc.
+library(tidyverse)
+#Used for creating a correlation plot between variables
+library(corrplot)
+#Used for analyzing missing data
+library(mice)
+#Used for theme and arranging plots
+library(ggpubr)
+#Levene's test
+library(car)
+#Used for developing decision tree models
+library(rpart)
+#The following libraries are used for rendering and visualizing the decision tree
+library(rattle)
+library(rpart.plot)
+library(RColorBrewer)
+library(knitr)
+# Convert between decimals and percents
+library(scales)
+library(caret)
+library(e1071)
+#Used to produce ROC curve
+library(pROC)
+
+#Set theme for graphs
+theme_set(theme_light())
+```
+
+Read in the datasets 
+```{r}
+TrainData <- titanic_train
+TestData <- titanic_test
+#Check the structure of the train data frame
+str(TrainData)
+#Peak at first 10 rows
+kable(head(TrainData))
+#Peak at last 10 rows
+kable(tail(TrainData))
+```
+
+As observed by checking the structure of the data, sex and embarked are chr variables that could be converted to factors:
+```{r}
+myCols <- c("Sex","Embarked", "Pclass")
+TrainData[,myCols] <- lapply(TrainData[,myCols], function(x) {as.factor(x)})
+#check the class of each variable
+sapply(TrainData,function(x) {class(x)})
+```
+
+Check the summary of TrainData. 
+```{r}
+summary(TrainData)
+```
+
+From the structure presented prior, it is clear the the majority of data for the variable Cabin is blank. Let's replace these blank values with NAs.
+```{r}
+TrainData$Cabin[TrainData$Cabin==""] <- NA
+#Check the blank values were correctly changed to NAs
+sum(is.na(TrainData$Cabin))
+#Calculate % missing for the variable Cabin
+paste("The percent of missing data for the variable cabin is: ", percent(sum(is.na(TrainData$Cabin))/length(TrainData$Cabin)))
+```
+
+There are also two blank values for the variable Embarked. These blank values will be replaced with S (Southampton), by far the most common point of embarkation.  
+```{r}
+TrainData$Embarked[TrainData$Embarked == ""] <- "S"
+```
+
+# Missing Data
+The missingness of this dataset is assessed by counting the number of NAs in each column.
+The variable age has missing data (177 out of 891) that could be imputted--this will be futher explored in the subsequent sections.
+```{r warning=FALSE}
+missN <- sapply(TrainData, function(x) sum((is.na(x))))
+missN <- data.frame(missN)
+#Only retain rows where the count of NAs is > 0. drop = FALSE is needed since the dataframe is 1 dimension
+missN[missN>0,,drop=FALSE]
+```
+
+## Age Imputation
+One simple approach to handle the data imputation would be by using the mean age, either overall or by subgroups. For instance, how does mean age differ across Pclass? If there are differences, the mean age for Pclass 1,2,and 3 could be used to impute missing values. 
+
+```{r warning=FALSE}
+#Print the mean, SD, and N for Pclass 1, 2, and 3
+TrainData %>%
+  group_by(Pclass) %>%
+  summarise(mean=mean(Age,na.rm=TRUE), sd = sd(Age,na.rm=TRUE),n=n())
+```
+
+
+Boxplots by Pclass are presented below. Passenger class is be negatively correlated with age. Refer to the section [Correlation](#correlation) for additional details. 
+```{r warning=FALSE}
+ggplot(data=TrainData,aes(x=Pclass,y=Age,color=Pclass)) +
+  geom_boxplot() +
+  stat_summary(fun.y=mean,shape=1,col='black',geom='point',na.rm = TRUE)+
+  labs(x="Passenger Class")+
+  theme(panel.grid.major.y = element_blank(),
+  panel.grid.minor.y = element_blank(),
+  panel.grid.major.x = element_blank(),
+  panel.grid.minor.x = element_blank())
+
+```
+
+### ANOVA
+We can compare the means for the three groups using one-way ANOVA.
+
+$H_{0}: \mu_{1} = \mu_{2}=\mu_{3}$ vs $H_{a}:$ at least one mean is different.
+
+Here we will determine whether there is any significant difference between the average ages of passengers in the three classes (first, second, and third class)
+```{r}
+#Conduct one-way anova test and save it to the variable my_aov
+my_aov <- aov(Age ~ Pclass, data=TrainData)
+#Print summary of one-way anova test
+summary(my_aov)
+```
+
+Note that the output from summary includes the column Pr(>F) which is the p-value of the test. As the p-value is less than the significance level of 0.05, we can reject the null hypothesis in favor of the alternative hypothesis; that is, we conclude that at least one mean is different from the other means.
+
+Conduct multiple pairwise-comparison between the means of groups using Tukey HSD. 
+From the output below, the difference between all the passenger classes is significant, with adjusted p-values <0.05. The Tukey pairwise comparisons suggest that all the means are different. 
+```{r}
+TukeyHSD(my_aov)
+```
+
+Check the homogeneity of variance assumption for the ANOVA model.
+
+We can see that from our three factor levels, 12.5 is the smallest and 14.8 is the lasrgest SD. Furthermore, our samples sizes are quite different, so we cannot use the informal check of the ratio of two standard sample standard deviaitons (see https://newonlinecourses.science.psu.edu/stat500/lesson/7/7.3/7.3.1/7.3.1.1). 
+```{r warning=FALSE}
+TrainData %>%
+  select(Age, Pclass) %>%
+  group_by(Pclass) %>%
+  summarize(mean = mean(Age, na.rm = T), SDs = sd(Age, na.rm = T), Counts = n())
+```
+
+For the residual vs fits plot, certain points are detected as outliers (852,117,631).
+
+Levene's test is also used to assess the equality of variances; it tests the null hypothesis that the population variances are equal. Note that the p-value is less than 0.05, the significance level, and thus the null hypothesis is rejected--it is concluded that there is a difference between the variances in the population.
+```{r}
+#Print the residuals vs fits plot. 
+plot(my_aov, 1)
+#Use Levene's test to assess the equality of variances.
+leveneTest(Age ~ Pclass, data = TrainData)
+```
+
+Since the homogeneity of variance assumption has been violated, we can consider Welch's one-way ANOVA. The conclusions are the same as the classic one-way ANOVA, presented above. 
+```{r}
+#Welch's ANOVA--no assumption of equal variances
+oneway.test(Age~Pclass, data=TrainData)
+#Pairwise t-tests with no assumption of equal variances
+pairwise.t.test(TrainData$Age, TrainData$Pclass ,p.adjust.method = "BH",pool.sd = FALSE)
+```
+
+Check the normality assumption for an ANOVA model. Based on the Q-Q plot and Shapiro-Wilk test, the normality assumption is not met.The null-hypothesis of the Shapiro-Wilk test is that the population is normally distributed.Based on the calculated p-value and alpha = 0.05, the null hypothesis is rejected and there is evidence that the data tested are not normally distributed.
+```{r}
+#Q-Q plot
+plot(my_aov, 2)
+# Extract the residuals
+aov_residuals <- residuals(object = my_aov)
+# Run Shapiro-Wilk test.
+shapiro.test(x = aov_residuals)
+```
+
+Since the ANOVA assumptions have been violated, a non-parametric alternative to one-way ANOVA, Kruskal-Wallis rank sum test, is implemented. The conclusion is the same before: there are significant differences in the average age between all passenger classes.
+```{r}
+kruskal.test(Age ~ Pclass, data = TrainData)
+pairwise.wilcox.test(TrainData$Age, TrainData$Pclass,
+                 p.adjust.method = "BH")
+```
+
+### MICE
+Next, the MICE package is used to assess and impute missing data. Multiple imputation will be implemented as opposed to the simple mean-based approach explored above.
+As observed prior, we have two variables with missing values. md.pattern() is used to ascertain a better understanding of the pattern of missing data. 177 missing values for age and 687 missing values for cabin.
+```{r}
+md.pattern(TrainData)
+```
+
+```{r}
+#Dropping cabin from the analysis due to the large % of missing data 687/891 = 77%
+TrainData <-
+  TrainData %>%
+  select(-Cabin)
+```
+
+Adjust the TrainData to prepare for data imputation
+```{r}
+#Remove char variables that won't be needed for imputation and assign to a new dataframe, TrainData_Impute
+TrainData_Impute <- TrainData[,!(names(TrainData) %in% c("Name","Ticket"))]
+```
+
+The mice() function takes care of the imputing process. m refers to the number of imputted datasets--set to the default of 5. 
+```{r warning=FALSE}
+myMice <- mice(TrainData_Impute,m=5,seed=400)
+#Check summary
+summary(myMice)
+```
+
+Get the completed dataset using complete(). Use the first of the 5 imputted datasets.
+```{r}
+TrainData_Impute <- complete(myMice,1)
+```
+
+Compare the original Age (excluding missing values) vs Age (including imputed values)
+```{r message=FALSE, warning=FALSE}
+plot1 <- TrainData%>%
+  ggplot(aes(x=Age))+
+  geom_histogram(aes(y=..density..), color="black", fill="lightblue")+
+  geom_density(alpha=.2, fill="#FF6666")+
+  theme(panel.grid.major.y = element_blank(),
+  panel.grid.minor.y = element_blank(),
+  panel.grid.major.x = element_blank(),
+  panel.grid.minor.x = element_blank())
+plot2 <- TrainData_Impute%>%
+  ggplot(aes(x=Age))+
+  geom_histogram(aes(y=..density..), color="black", fill="lightblue")+
+  geom_density(alpha=.2, fill="#FF6666")+
+  theme(panel.grid.major.y = element_blank(),
+  panel.grid.minor.y = element_blank(),
+  panel.grid.major.x = element_blank(),
+  panel.grid.minor.x = element_blank())
+
+ggarrange(plot1,plot2,labels=c("A","B"),ncol=2,nrow=1)
+```
+
+The age distribution (including imputted values) looks quite similar to the original. 
+```{r}
+#Replace Age with imputed Age
+TrainData$Age <- TrainData_Impute$Age
+```
+
+# Exploring Count Data
+
+For Survived, 1 indicates yes and 0 indicates no. As discussed in the [Introduction](#introduction), survival is the main outcome of interest that we are trying to predict. From the dataset, it was calculated that 549 passengers (61.6%) died and 342 (38.4%) died.  
+
+The second count is a breakdown of the gender distribution of passengers--the majority of passengers were male.
+
+The third count is stratified by survival status and sex. 68% of females survived, whereas only 32% of males survived.
+```{r}
+TrainData %>%
+  group_by(Survived) %>%
+  summarise(n=n())%>%
+  mutate(percent=n/sum(n))
+
+TrainData %>%
+  group_by(Sex) %>%
+  summarise (n=n())%>%
+  mutate(percent=n/sum(n))
+
+TrainData %>%
+  group_by(Survived,Sex) %>%
+  summarise (n=n())%>%
+  mutate(percent=n/sum(n))
+```
+
+The variable Pclass describes the passenger's travel "class" and is a three-level, ordered categorical variable, where 1, 2, and 3 signify first, second, and third class, respectively. Approx half of the passengers were travelling third class
+```{r}
+#Clearly, the highest count is 3rd class and death
+TrainData %>%
+  count(Survived, Pclass, sort=T)
+
+TrainData %>%
+  ggplot(aes(x=Pclass, fill=factor(Survived),color=factor(Survived))) +
+  geom_bar(alpha=0.4) +
+  xlab("Passenger Class") +
+  ylab("Count") +
+  labs(fill="Survived")+
+  theme(panel.grid.major.y = element_blank(),
+  panel.grid.minor.y = element_blank(),
+  panel.grid.major.x = element_blank(),
+  panel.grid.minor.x = element_blank())
+```
+
+The variables Parch and SibSp are count variables, counting the number of parents/children and siblings/spouses aboard. Most passengers traveled alone.
+```{r}
+TrainData %>%
+  ggplot(aes(x=Parch,fill=factor(Parch),color=factor(Parch)))+
+  geom_bar(alpha=0.4)+
+  xlab("# of Parents/Children")+
+  ylab("Count")+
+  theme(legend.position="none")+
+  theme(panel.grid.major.y = element_blank(),
+  panel.grid.minor.y = element_blank(),
+  panel.grid.major.x = element_blank(),
+  panel.grid.minor.x = element_blank())
+
+TrainData %>%
+  ggplot(aes(x=SibSp,fill=factor(SibSp),color=factor(SibSp)))+
+  geom_bar(alpha=0.4)+
+  xlab("# of Siblings/Spouses")+
+  ylab("Count")+
+  theme(legend.position="none")+
+  theme(panel.grid.major.y = element_blank(),
+  panel.grid.minor.y = element_blank(),
+  panel.grid.major.x = element_blank(),
+  panel.grid.minor.x = element_blank())
+```
+
+The points of embarkation were C = Cherbourg; Q = Queenstown; S = Southampton. The majority of passengers embarked at Southampton.
+```{r}
+TrainData %>%
+  ggplot(aes(x=Embarked,fill=factor(Survived),color=factor(Survived)))+
+  geom_bar(alpha=0.4)+
+  theme(panel.grid.major.y = element_blank(),
+  panel.grid.minor.y = element_blank(),
+  panel.grid.major.x = element_blank(),
+  panel.grid.minor.x = element_blank())
+```
+
+The age distributions (including imputted values) for males and females are presented below.
+All senior passengers aged 65 years+ were male. 
+```{r message=FALSE}
+TrainData %>%
+  ggplot(aes(x=Age))+
+  geom_histogram(fill="lightblue",color="black")+
+  facet_grid(~Sex)+
+  theme(panel.grid.major.y = element_blank(),
+  panel.grid.minor.y = element_blank(),
+  panel.grid.major.x = element_blank(),
+  panel.grid.minor.x = element_blank())
+
+TrainData %>%
+  ggplot(aes(x=Age, color=Sex,fill=Sex))+
+  geom_density(alpha=0.4)+
+  theme(panel.grid.major.y = element_blank(),
+  panel.grid.minor.y = element_blank(),
+  panel.grid.major.x = element_blank(),
+  panel.grid.minor.x = element_blank())
+```
+
+The oldest male and female passengers were 80 and 63 years, respectively. 
+```{r}
+TrainData %>%
+  select(Age,Sex) %>%
+  group_by(Sex) %>%
+  summarise(max_age=max(Age), min_age=min(Age)) %>%
+  arrange(desc(max_age))
+```
+
+The age distribution stratified by (1) sex and (2) survival outcome (yes=1). 
+```{r message=FALSE}
+TrainData %>%
+  ggplot(aes(x=Age,color=factor(Survived),fill=factor(Survived)))+
+  geom_histogram(alpha=0.4)+
+  facet_grid(~Sex)+
+  theme(panel.grid.major.y = element_blank(),
+  panel.grid.minor.y = element_blank(),
+  panel.grid.major.x = element_blank(),
+  panel.grid.minor.x = element_blank())
+```
+
+The relationship between fare and survival.
+```{r}
+TrainData %>%
+  ggplot(aes(x=Fare,fill=factor(Survived),color=factor(Survived)))+
+  geom_histogram(binwidth=50,alpha=0.4)+
+  theme(panel.grid.major.y = element_blank(),
+  panel.grid.minor.y = element_blank(),
+  panel.grid.major.x = element_blank(),
+  panel.grid.minor.x = element_blank())
+```
+
+Check to see what data is available from the variable Name
+```{r}
+head(TrainData$Name)
+```
+
+Extract title's using the function grepl. Rare titles were categorized as "other"
+```{r}
+TrainData <- TrainData %>%
+  mutate(Title = case_when(
+    grepl("Miss.", Name) ~ "Miss",
+    grepl("Master.", Name) ~ "Master",
+    grepl("Mrs.", Name) ~ "Mrs",
+    grepl("Mr.", Name) ~ "Mr",
+    TRUE ~ "Other"))
+```
+
+Check the frequency of each title by sex.
+```{r}
+# Frequency of each title by sex
+kable(table(TrainData$Sex, TrainData$Title))
+
+#Change to factor
+TrainData$Title <- as.factor(TrainData$Title)
+```
+
+Distribution of title and survival in each passenger class is presented below. Miss, Master, and Mrs. have higher probabilities of survival, especially in class 1 and 2.
+```{r}
+TrainData%>%
+  ggplot(aes(Title,fill=factor(Survived),color=factor(Survived)))+
+  geom_bar(alpha=0.4)+
+  facet_wrap(~Pclass)+
+  theme(panel.grid.major.y = element_blank(),
+  panel.grid.minor.y = element_blank(),
+  panel.grid.major.x = element_blank(),
+  panel.grid.minor.x = element_blank())
+```
+
+
+```{r message=FALSE}
+#Box plot of age by Title and Pclass
+TrainData%>%
+  ggplot(aes(x=Title,y=Age,color=Pclass,fill=Pclass))+
+  geom_boxplot(alpha=0.4)+
+  theme(panel.grid.major.y = element_blank(),
+  panel.grid.minor.y = element_blank(),
+  panel.grid.major.x = element_blank(),
+  panel.grid.minor.x = element_blank())
+
+#Age distribution for each Title
+TrainData %>%
+  ggplot(aes(Age,fill=Title))+
+  geom_histogram()+
+  facet_wrap(~Title)+
+  theme(legend.position = "none")+
+  theme(panel.grid.major.y = element_blank(),
+  panel.grid.minor.y = element_blank(),
+  panel.grid.major.x = element_blank(),
+  panel.grid.minor.x = element_blank())
+```
+
+A chi square test is conducted to assess the relationship between data that are counts (frequencies) or proportions.  
+Null hypothesis: (1) survival and sex and (2) survival and class are independent.  In other words, everyone (irrespective of sex or class) had the same chance of survival.
+Here the p-values are quite low, well below a 5% level, so we would reject the null hypothesis. 
+```{r}
+chisq.test(TrainData$Survived, TrainData$Sex)
+chisq.test(TrainData$Survived, TrainData$Pclass)
+```
+
+Similarly, the chi square test is conducted to assess the relationship between Survived and the derived variable Title.
+```{r}
+chisq.test(TrainData$Survived,TrainData$Title)
+```
+
+# Correlation
+First, need to convert factors to numeric/integers. 
+```{r}
+TrainData2 <- TrainData %>%
+  mutate(Sex=ifelse(Sex == "male",1,0))
+TrainData2$Pclass <- as.integer(TrainData2$Pclass)
+TrainData2$Title <- as.integer(TrainData2$Title)
+```
+
+Calculate correlation matrix and plot.
+Sex has the strongest correlation with Survived (-0.54)--they are negatively correlated since Sex is coded male = 1 and female = 0 and the latter had a much higher probability of survival. 
+Pclass is also negatively correlated with Survived--that is, as the passenger class increases, the probability of survival decreases. Fare is negatively correlated with Pclass and Fare is positively correlated with Survived--higher the Fare, the higher the probability of survival.
+```{r}
+#Select variables that are int/numeric data types.
+TrainData2 <- TrainData2[,c(2:3,5:8,10,12)]
+cor(TrainData2)
+cor_TrainData2 <- cor(TrainData2)
+corrplot(cor_TrainData2)
+```
+
+# Model Building
+Now let's conduct a logistic regression. 
+First, remove variables that won't be used in the development of the logistic regression model
+```{r}
+TrainData_sub <-
+  TrainData %>%
+  select(-PassengerId,-Name,-Ticket)
+```
+
+Significant predictors include Pclass, Age, SibSp, Parch, TitleMR, and TitleOther
+```{r}
+#Fit the model and print the summary
+myModel <- glm(Survived ~ .,family=binomial(link="logit"),data=TrainData_sub)
+summary(myModel)
+```
+
+```{r}
+#Predict survival probabilities using the logistic regression model
+Sprob <- predict(myModel, TrainData, type="response")
+
+#Check the predicted survival probabilities
+head(Sprob)
+
+#Set a threshold of 0.5 and assign death (=1) if the predicted survival probability if greater than 0.5 and assign alive otherwise (=0)
+TrainData <- TrainData %>%
+  mutate(PredSurv = ifelse(Sprob>0.5,1,0)) %>%
+  mutate(Compare = ifelse(Survived == PredSurv,"Correct","Incorrect"))
+```
+
+Validate the predicted survival status (alive vs dead) versus the actual observed data--84% of the predictions are correct. 
+```{r}
+TrainData %>%
+  group_by(Compare) %>%
+  summarise(n=n())%>%
+  mutate(percent=n/sum(n))
+```
+
+Next, let's use the caret to produce a confusion matrix in order to determine how many observations were correctly or incorrectly classified.This is similar to above, but we can look at the number correct by factor level--the sum of the correct predictions found in the diagonal of the matrix (489+259) is 748, which matches our calculation above; by default, the caret package uses the same threshold of 0.5 to classify the predictions obtained from the logistic model, hence the same results as we calculated manually.The accuracy reported by the confusionMatrix function also matches as expected: $\frac{489+259}{489+83+60+259} = 0.8395\approx0.84$.
+
+Additionally, the sensitivty and specificity are outputted, as they are commonly used the performance of classification models, such as logistic regression. 
+The sensitivity, or recall or true positive rate, is $\mathbb{P}(PredSurvival | ObsSurvival)=0.8907$
+and the specificity, or true negative rate is $\mathbb{P}(PredDeath | ObsDeath)=0.7573$
+
+The kappa is 0.6563, which is the accuracy corrected for chance. This indicates good agreement between the the predictions and observed values.
+```{r}
+confusionMatrix(as.factor(TrainData$PredSurv), as.factor(TrainData$Survived))
+```
+
+The ROC curve is commonly used to examine the trade-off between the detection of true positives (sensitivity), while avoiding the false positives (specificity). The gray diagonal line represents a classifier no better than random chance. We observe that our ROC rises steeply to the top-left corner, which is indicative of a good performaing classifier, as it will correctly identify alot of the positive cases and incorrectly classifies a much smaller number of positive cases. 
+
+Note that this plot also presents the AUC (i.e., area under the curve), which is another measure of the quality of the model. Possible AUC values ranges from 0.5 (i.e., a classifier with no predictive value) to 1.0 (i.e., a perfect classifier), so we have a good-to-excellent performing classifer based on the AUC value. 
+```{r}
+plot.roc(roc(as.factor(TrainData$Survived),Sprob), print.auc = TRUE)
+```
+
+Develop a decision tree model
+```{r}
+DT <- rpart(Survived~.,data=TrainData_sub,method = "class")
+#Check the DT
+fancyRpartPlot(DT)
+```
+
+```{r}
+#Apply the decision tree model to the data
+predict2 <- predict(DT, TrainData, type="class")
+
+#Add a column to record the predicted survival and compare to the observed data
+TrainData <- TrainData %>%
+  mutate(PredSurv_DT = predict2) %>%
+  mutate(Compare2 = ifelse(Survived == PredSurv_DT,"Correct","Incorrect"))
+
+#The percent of correct predictions (84.4%) is approximately the same as the logistic regression model.
+TrainData %>%
+  group_by(Compare2) %>%
+  summarise(n=n())%>%
+  mutate(percent=n/sum(n))
+```
+
